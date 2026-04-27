@@ -6,10 +6,13 @@ FastAPI + SQLAlchemy (PostgreSQL) + WebSockets + JWT Authentication
 # ─────────────────────────────────────────────
 # DEPENDENCIES
 # pip install fastapi uvicorn sqlalchemy asyncpg psycopg2-binary
-#             passlib[bcrypt] python-jose[cryptography] python-dotenv
+#             bcrypt python-jose[cryptography] python-dotenv
 # ─────────────────────────────────────────────
 
-import os, uuid, random
+import logging
+import os
+import random
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from enum import Enum
@@ -32,7 +35,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.future import select
 
 # ── Auth ─────────────────────────────────────
-from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 # ── Pydantic ─────────────────────────────────
@@ -42,13 +44,21 @@ from pydantic import BaseModel, ConfigDict, Field
 # CONFIG
 # =============================================================
 
-DATABASE_URL  = os.getenv("DATABASE_URL",
-                    "sqlite+aiosqlite:///./supplychain.db")
+DATABASE_URL = os.getenv("DATABASE_URL",
+                         "sqlite+aiosqlite:///./supplychain.db")
 
+# SECRET_KEY: set a strong random value in production.
+# ENV: set to "production" to enforce a strong key at startup.
+_INSECURE_DEFAULT_KEY = "change-me-in-production-use-256-bit-random"
+SECRET_KEY   = os.getenv("SECRET_KEY", _INSECURE_DEFAULT_KEY)
+ALGORITHM    = "HS256"
+TOKEN_EXPIRE = int(os.getenv("TOKEN_EXPIRE_MINUTES", 60))
 
-SECRET_KEY    = os.getenv("SECRET_KEY", "change-me-in-production-use-256-bit-random")
-ALGORITHM     = "HS256"
-TOKEN_EXPIRE  = int(os.getenv("TOKEN_EXPIRE_MINUTES", 60))
+# CORS_ALLOW_ORIGINS: comma-separated list of allowed origins.
+# Defaults to "*" (all origins) – set explicitly in production.
+# Example: CORS_ALLOW_ORIGINS=https://app.example.com,https://admin.example.com
+_cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "*")
+CORS_ALLOW_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",")]
 
 # =============================================================
 # DATABASE SETUP
@@ -209,9 +219,18 @@ class DashboardStats(BaseModel):
 # =============================================================
 
 import bcrypt
-oauth2    = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-def hash_password(pw: str)         -> str:
+logger = logging.getLogger(__name__)
+
+oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def normalize_shipment_id(sid: str) -> str:
+    """Return a consistently normalized shipment ID (stripped, uppercase)."""
+    return sid.strip().upper()
+
+
+def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -259,9 +278,18 @@ class ConnectionManager:
     async def connect(self, ws: WebSocket, room: str = "global"):
         await ws.accept()
         self._connections.setdefault(room, []).append(ws)
+        logger.info("WebSocket connected: room=%s", room)
 
     def disconnect(self, ws: WebSocket, room: str = "global"):
-        self._connections.get(room, []).remove(ws)
+        room_conns = self._connections.get(room, [])
+        if ws in room_conns:
+            room_conns.remove(ws)
+            logger.info("WebSocket disconnected: room=%s", room)
+        else:
+            logger.debug("disconnect called for unknown WebSocket in room=%s", room)
+        # Clean up empty rooms to prevent memory growth
+        if room in self._connections and not self._connections[room]:
+            del self._connections[room]
 
     async def broadcast(self, message: dict, room: str = "global"):
         dead = []
@@ -269,6 +297,7 @@ class ConnectionManager:
             try:
                 await ws.send_json(message)
             except Exception:
+                logger.warning("Broadcast failed for a client in room=%s; removing", room)
                 dead.append(ws)
         for ws in dead:
             self.disconnect(ws, room)
@@ -285,13 +314,25 @@ ws_manager = ConnectionManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Warn or fail fast if the insecure default SECRET_KEY is still in use
+    env = os.getenv("ENV", "development").lower()
+    if SECRET_KEY == _INSECURE_DEFAULT_KEY:
+        if env == "production":
+            raise RuntimeError(
+                "SECRET_KEY is set to the insecure default. "
+                "Set a strong SECRET_KEY before running in production."
+            )
+        logger.warning(
+            "SECRET_KEY is set to the insecure default. "
+            "Set ENV=production and a strong SECRET_KEY before deploying."
+        )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
 
 
 app = FastAPI(title="Smart Supply Chain API", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ALLOW_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
 
 # =============================================================
@@ -305,7 +346,8 @@ async def register(data: UserCreate, db: AsyncSession = Depends(get_db)):
     if existing.scalar_one_or_none():
         raise HTTPException(400, "Email already registered")
     user = UserORM(email=data.email, username=data.username,
-                   hashed_pw=hash_password(data.password), role=data.role)
+                   hashed_pw=hash_password(data.password),
+                   role=UserRole.OPERATOR)  # role is always OPERATOR on public registration
     db.add(user)
     await db.commit()
     await db.refresh(user)
@@ -381,7 +423,7 @@ async def create_shipment(data: ShipmentCreate,
 @app.get("/shipments/{sid}", response_model=ShipmentOut, tags=["Shipments"])
 async def get_shipment(sid: str, db: AsyncSession = Depends(get_db),
                         _=Depends(get_current_user)):
-    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == sid.upper()))
+    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == normalize_shipment_id(sid)))
     s   = res.scalar_one_or_none()
     if not s: raise HTTPException(404, "Shipment not found")
     return s
@@ -390,7 +432,7 @@ async def get_shipment(sid: str, db: AsyncSession = Depends(get_db),
 async def update_shipment(sid: str, update: ShipmentUpdate,
                            db: AsyncSession = Depends(get_db),
                            user=Depends(require_role(UserRole.ADMIN, UserRole.OPERATOR))):
-    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == sid.upper()))
+    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == normalize_shipment_id(sid)))
     s   = res.scalar_one_or_none()
     if not s: raise HTTPException(404, "Shipment not found")
     for f, v in update.dict(exclude_none=True).items():
@@ -404,7 +446,7 @@ async def update_shipment(sid: str, update: ShipmentUpdate,
 @app.post("/shipments/{sid}/advance", response_model=ShipmentOut, tags=["Shipments"])
 async def advance_stage(sid: str, db: AsyncSession = Depends(get_db),
                          user=Depends(require_role(UserRole.ADMIN, UserRole.OPERATOR))):
-    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == sid.upper()))
+    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == normalize_shipment_id(sid)))
     s   = res.scalar_one_or_none()
     if not s: raise HTTPException(404, "Shipment not found")
     order = list(PipelineStage)
@@ -420,7 +462,7 @@ async def advance_stage(sid: str, db: AsyncSession = Depends(get_db),
 @app.delete("/shipments/{sid}", status_code=204, tags=["Shipments"])
 async def delete_shipment(sid: str, db: AsyncSession = Depends(get_db),
                            _=Depends(require_role(UserRole.ADMIN))):
-    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == sid.upper()))
+    res = await db.execute(select(ShipmentORM).where(ShipmentORM.id == normalize_shipment_id(sid)))
     s   = res.scalar_one_or_none()
     if not s: raise HTTPException(404, "Shipment not found")
     await db.delete(s)
@@ -464,7 +506,8 @@ async def create_alert(data: AlertCreate,
     # mark affected shipment delayed in background
     async def flag(sid: str):
         async with AsyncSession_() as s:
-            r = await s.execute(select(ShipmentORM).where(ShipmentORM.id == sid.upper()))
+            r = await s.execute(select(ShipmentORM).where(
+                ShipmentORM.id == normalize_shipment_id(sid)))
             ship = r.scalar_one_or_none()
             if ship:
                 ship.status = ShipmentStatus.DELAYED
@@ -495,7 +538,7 @@ async def optimize_route(req: OptimizeRequest,
                           db: AsyncSession = Depends(get_db),
                           user=Depends(require_role(UserRole.ADMIN, UserRole.OPERATOR))):
     res = await db.execute(
-        select(ShipmentORM).where(ShipmentORM.id == req.shipment_id.upper()))
+        select(ShipmentORM).where(ShipmentORM.id == normalize_shipment_id(req.shipment_id)))
     s = res.scalar_one_or_none()
     if not s: raise HTTPException(404, "Shipment not found")
     if not req.alternative_routes:
@@ -555,14 +598,17 @@ async def websocket_endpoint(ws: WebSocket, room: str,
     Rooms:     global | alerts | shipments
     Events:    new_alert · alert_resolved · shipment_created ·
                shipment_updated · pipeline_advanced · route_optimized
+    A valid JWT token (obtained via /auth/login) is required.
     """
-    # Validate JWT before accepting
-    if token:
-        try:
-            jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        except JWTError:
-            await ws.close(code=4001)
-            return
+    # Require a valid JWT token before accepting the connection
+    if not token:
+        await ws.close(code=4001, reason="Token required")
+        return
+    try:
+        jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        await ws.close(code=4001, reason="Invalid token")
+        return
 
     await ws_manager.connect(ws, room)
     await ws.send_json({"event": "connected", "room": room})
